@@ -35,7 +35,7 @@ CTxMemPool mempool;
 unsigned int nTransactionsUpdated = 0;
 
 map<uint256, CBlockIndex*> mapBlockIndex;
-uint256 hashGenesisBlock("0xb77526d9a938e121e66e12320924240e8e2f5f07e4b0d4061c382475e06bac23");
+uint256 hashGenesisBlock("0x434e0cf3afb9736f9de76d0095869d410635949cded671ebdb79f102f4495a47");
 static CBigNum bnProofOfWorkLimit(~uint256(0) >> 20); // Unitedemiratecoin: starting difficulty is 1 / 2^12
 CBlockIndex* pindexGenesisBlock = NULL;
 int nBestHeight = -1;
@@ -2749,7 +2749,7 @@ bool LoadBlockIndex()
         pchMessageStart[1] = 0xcb;
         pchMessageStart[2] = 0xbb;
         pchMessageStart[3] = 0xde;
-        hashGenesisBlock = uint256("0xb77526d9a938e121e66e12320924240e8e2f5f07e4b0d4061c382475e06bac23");
+        hashGenesisBlock = uint256("0xcae0461fa773448fca82dddb706f2b03062e96ff24e54ab09e8898654958f009");
     }
 
     //
@@ -2804,7 +2804,7 @@ bool InitBlockIndex() {
             block.nNonce   = 523352;
         }
 
-	if (true && block.GetHash() != hashGenesisBlock)
+	if (false && block.GetHash() != hashGenesisBlock)
         {
             printf("Searching for genesis block...\n");
             // This will figure out a valid hash and Nonce if you're
