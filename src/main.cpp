@@ -35,7 +35,7 @@ CTxMemPool mempool;
 unsigned int nTransactionsUpdated = 0;
 
 map<uint256, CBlockIndex*> mapBlockIndex;
-uint256 hashGenesisBlock("0x434e0cf3afb9736f9de76d0095869d410635949cded671ebdb79f102f4495a47");
+uint256 hashGenesisBlock("0xc524b9ad811de29190fe9580e13448ab00940fcd19dfc2a2d672a522c6443f99");
 static CBigNum bnProofOfWorkLimit(~uint256(0) >> 20); // Unitedemiratecoin: starting difficulty is 1 / 2^12
 CBlockIndex* pindexGenesisBlock = NULL;
 int nBestHeight = -1;
@@ -2749,7 +2749,7 @@ bool LoadBlockIndex()
         pchMessageStart[1] = 0xcb;
         pchMessageStart[2] = 0xbb;
         pchMessageStart[3] = 0xde;
-        hashGenesisBlock = uint256("0xcae0461fa773448fca82dddb706f2b03062e96ff24e54ab09e8898654958f009");
+        hashGenesisBlock = uint256("0x742977a13ee9bb570bf763f0d952e1a59f5f2357a63c5acfcc6a55c808925b6a");
     }
 
     //
