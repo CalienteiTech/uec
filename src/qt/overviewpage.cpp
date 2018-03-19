@@ -1,217 +1,532 @@
-// Copyright (c) 2011-2013 The Bitcoin developers
-// Distributed under the MIT/X11 software license, see the accompanying
+// Copyright (c) 2011-2015 The Bitcoin Core developers
+// Copyright (c) 2014-2017 The AltPay Core developers
+// Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "overviewpage.h"
-#include "ui_overviewpage.h"
+#if defined(HAVE_CONFIG_H)
+#include "config/aty-config.h"
+#endif
 
-#include "clientmodel.h"
-#include "walletmodel.h"
-#include "bitcoinunits.h"
 #include "optionsmodel.h"
-#include "transactiontablemodel.h"
-#include "transactionfilterproxy.h"
+
+#include "bitcoinunits.h"
 #include "guiutil.h"
-#include "guiconstants.h"
 
-#include <QAbstractItemDelegate>
-#include <QPainter>
+#include "amount.h"
+#include "init.h"
+#include "main.h" // For DEFAULT_SCRIPTCHECK_THREADS
+#include "net.h"
+#include "txdb.h" // for -dbcache defaults
 
-#define DECORATION_SIZE 64
-#define NUM_ITEMS 3
+#ifdef ENABLE_WALLET
+#include "wallet/wallet.h"
+#include "wallet/walletdb.h"
+#endif
 
-class TxViewDelegate : public QAbstractItemDelegate
+#include "darksend.h"
+#ifdef ENABLE_WALLET
+#include "masternodeconfig.h"
+#endif
+
+#include <QNetworkProxy>
+#include <QSettings>
+#include <QStringList>
+
+OptionsModel::OptionsModel(QObject *parent, bool resetSettings) :
+    QAbstractListModel(parent)
 {
-    Q_OBJECT
-public:
-    TxViewDelegate(): QAbstractItemDelegate(), unit(BitcoinUnits::BTC)
-    {
+    Init(resetSettings);
+}
 
-    }
+void OptionsModel::addOverriddenOption(const std::string &option)
+{
+    strOverriddenByCommandLine += QString::fromStdString(option) + "=" + QString::fromStdString(mapArgs[option]) + " ";
+}
 
-    inline void paint(QPainter *painter, const QStyleOptionViewItem &option,
-                      const QModelIndex &index ) const
-    {
-        painter->save();
+// Writes all missing QSettings with their default values
+void OptionsModel::Init(bool resetSettings)
+{
+    if (resetSettings)
+        Reset();
 
-        QIcon icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
-        QRect mainRect = option.rect;
-        QRect decorationRect(mainRect.topLeft(), QSize(DECORATION_SIZE, DECORATION_SIZE));
-        int xspace = DECORATION_SIZE + 8;
-        int ypad = 6;
-        int halfheight = (mainRect.height() - 2*ypad)/2;
-        QRect amountRect(mainRect.left() + xspace, mainRect.top()+ypad, mainRect.width() - xspace, halfheight);
-        QRect addressRect(mainRect.left() + xspace, mainRect.top()+ypad+halfheight, mainRect.width() - xspace, halfheight);
-        icon.paint(painter, decorationRect);
+    this->resetSettings = resetSettings;
 
-        QDateTime date = index.data(TransactionTableModel::DateRole).toDateTime();
-        QString address = index.data(Qt::DisplayRole).toString();
-        qint64 amount = index.data(TransactionTableModel::AmountRole).toLongLong();
-        bool confirmed = index.data(TransactionTableModel::ConfirmedRole).toBool();
-        QVariant value = index.data(Qt::ForegroundRole);
-        QColor foreground = option.palette.color(QPalette::Text);
-        if(value.canConvert<QBrush>())
-        {
-            QBrush brush = qvariant_cast<QBrush>(value);
-            foreground = brush.color();
-        }
+    QSettings settings;
 
-        painter->setPen(foreground);
-        painter->drawText(addressRect, Qt::AlignLeft|Qt::AlignVCenter, address);
+    // Ensure restart flag is unset on client startup
+    setRestartRequired(false);
 
-        if(amount < 0)
-        {
-            foreground = COLOR_NEGATIVE;
-        }
-        else if(!confirmed)
-        {
-            foreground = COLOR_UNCONFIRMED;
-        }
+    // These are Qt-only settings:
+
+    // Window
+    if (!settings.contains("fMinimizeToTray"))
+        settings.setValue("fMinimizeToTray", false);
+    fMinimizeToTray = settings.value("fMinimizeToTray").toBool();
+
+    if (!settings.contains("fMinimizeOnClose"))
+        settings.setValue("fMinimizeOnClose", false);
+    fMinimizeOnClose = settings.value("fMinimizeOnClose").toBool();
+
+    // Display
+    if (!settings.contains("nDisplayUnit"))
+        settings.setValue("nDisplayUnit", BitcoinUnits::ATY);
+    nDisplayUnit = settings.value("nDisplayUnit").toInt();
+
+    if (!settings.contains("strThirdPartyTxUrls"))
+        settings.setValue("strThirdPartyTxUrls", "");
+    strThirdPartyTxUrls = settings.value("strThirdPartyTxUrls", "").toString();
+
+    if (!settings.contains("fCoinControlFeatures"))
+        settings.setValue("fCoinControlFeatures", false);
+    fCoinControlFeatures = settings.value("fCoinControlFeatures", false).toBool();
+
+    if (!settings.contains("digits"))
+        settings.setValue("digits", "2");
+    if (!settings.contains("theme"))
+        settings.setValue("theme", "");
+
+    if (!settings.contains("fShowMasternodesTab"))
+        settings.setValue("fShowMasternodesTab", masternodeConfig.getCount());
+
+    if (!settings.contains("fShowAdvancedPSUI"))
+        settings.setValue("fShowAdvancedPSUI", false);
+    fShowAdvancedPSUI = settings.value("fShowAdvancedPSUI", false).toBool();
+
+    if (!settings.contains("fLowKeysWarning"))
+        settings.setValue("fLowKeysWarning", true);
+
+    // These are shared with the core or have a command-line parameter
+    // and we want command-line parameters to overwrite the GUI settings.
+    //
+    // If setting doesn't exist create it with defaults.
+    //
+    // If SoftSetArg() or SoftSetBoolArg() return false we were overridden
+    // by command-line and show this in the UI.
+
+    // Main
+    if (!settings.contains("nDatabaseCache"))
+        settings.setValue("nDatabaseCache", (qint64)nDefaultDbCache);
+    if (!SoftSetArg("-dbcache", settings.value("nDatabaseCache").toString().toStdString()))
+        addOverriddenOption("-dbcache");
+
+    if (!settings.contains("nThreadsScriptVerif"))
+        settings.setValue("nThreadsScriptVerif", DEFAULT_SCRIPTCHECK_THREADS);
+    if (!SoftSetArg("-par", settings.value("nThreadsScriptVerif").toString().toStdString()))
+        addOverriddenOption("-par");
+
+    // Wallet
+#ifdef ENABLE_WALLET
+    if (!settings.contains("bSpendZeroConfChange"))
+        settings.setValue("bSpendZeroConfChange", true);
+    if (!SoftSetBoolArg("-spendzeroconfchange", settings.value("bSpendZeroConfChange").toBool()))
+        addOverriddenOption("-spendzeroconfchange");
+
+    // PrivateSend
+    if (!settings.contains("nPrivateSendRounds"))
+        settings.setValue("nPrivateSendRounds", DEFAULT_PRIVATESEND_ROUNDS);
+    if (!SoftSetArg("-privatesendrounds", settings.value("nPrivateSendRounds").toString().toStdString()))
+        addOverriddenOption("-privatesendrounds");
+    nPrivateSendRounds = settings.value("nPrivateSendRounds").toInt();
+
+    if (!settings.contains("nPrivateSendAmount")) {
+        // for migration from old settings
+        if (!settings.contains("nAnonymizeAltPayAmount"))
+            settings.setValue("nPrivateSendAmount", DEFAULT_PRIVATESEND_AMOUNT);
         else
+            settings.setValue("nPrivateSendAmount", settings.value("nAnonymizeAltPayAmount").toInt());
+    }
+    if (!SoftSetArg("-privatesendamount", settings.value("nPrivateSendAmount").toString().toStdString()))
+        addOverriddenOption("-privatesendamount");
+    nPrivateSendAmount = settings.value("nPrivateSendAmount").toInt();
+
+    if (!settings.contains("fPrivateSendMultiSession"))
+        settings.setValue("fPrivateSendMultiSession", DEFAULT_PRIVATESEND_MULTISESSION);
+    if (!SoftSetBoolArg("-privatesendmultisession", settings.value("fPrivateSendMultiSession").toBool()))
+        addOverriddenOption("-privatesendmultisession");
+    fPrivateSendMultiSession = settings.value("fPrivateSendMultiSession").toBool();
+#endif
+
+    // Network
+    if (!settings.contains("fUseUPnP"))
+        settings.setValue("fUseUPnP", DEFAULT_UPNP);
+    if (!SoftSetBoolArg("-upnp", settings.value("fUseUPnP").toBool()))
+        addOverriddenOption("-upnp");
+
+    if (!settings.contains("fListen"))
+        settings.setValue("fListen", DEFAULT_LISTEN);
+    if (!SoftSetBoolArg("-listen", settings.value("fListen").toBool()))
+        addOverriddenOption("-listen");
+
+    if (!settings.contains("fUseProxy"))
+        settings.setValue("fUseProxy", false);
+    if (!settings.contains("addrProxy"))
+        settings.setValue("addrProxy", "127.0.0.1:9050");
+    // Only try to set -proxy, if user has enabled fUseProxy
+    if (settings.value("fUseProxy").toBool() && !SoftSetArg("-proxy", settings.value("addrProxy").toString().toStdString()))
+        addOverriddenOption("-proxy");
+    else if(!settings.value("fUseProxy").toBool() && !GetArg("-proxy", "").empty())
+        addOverriddenOption("-proxy");
+
+    if (!settings.contains("fUseSeparateProxyTor"))
+        settings.setValue("fUseSeparateProxyTor", false);
+    if (!settings.contains("addrSeparateProxyTor"))
+        settings.setValue("addrSeparateProxyTor", "127.0.0.1:9050");
+    // Only try to set -onion, if user has enabled fUseSeparateProxyTor
+    if (settings.value("fUseSeparateProxyTor").toBool() && !SoftSetArg("-onion", settings.value("addrSeparateProxyTor").toString().toStdString()))
+        addOverriddenOption("-onion");
+    else if(!settings.value("fUseSeparateProxyTor").toBool() && !GetArg("-onion", "").empty())
+        addOverriddenOption("-onion");
+
+    // Display
+    if (!settings.contains("language"))
+        settings.setValue("language", "");
+    if (!SoftSetArg("-lang", settings.value("language").toString().toStdString()))
+        addOverriddenOption("-lang");
+
+    language = settings.value("language").toString();
+}
+
+void OptionsModel::Reset()
+{
+    QSettings settings;
+
+    // Remove all entries from our QSettings object
+    settings.clear();
+    resetSettings = true; // Needed in aty.cpp during shotdown to also remove the window positions
+
+    // default setting for OptionsModel::StartAtStartup - disabled
+    if (GUIUtil::GetStartOnSystemStartup())
+        GUIUtil::SetStartOnSystemStartup(false);
+}
+
+int OptionsModel::rowCount(const QModelIndex & parent) const
+{
+    return OptionIDRowCount;
+}
+
+// read QSettings values and return them
+QVariant OptionsModel::data(const QModelIndex & index, int role) const
+{
+    if(role == Qt::EditRole)
+    {
+        QSettings settings;
+        switch(index.row())
         {
-            foreground = option.palette.color(QPalette::Text);
+        case StartAtStartup:
+            return GUIUtil::GetStartOnSystemStartup();
+        case MinimizeToTray:
+            return fMinimizeToTray;
+        case MapPortUPnP:
+#ifdef USE_UPNP
+            return settings.value("fUseUPnP");
+#else
+            return false;
+#endif
+        case MinimizeOnClose:
+            return fMinimizeOnClose;
+
+        // default proxy
+        case ProxyUse:
+            return settings.value("fUseProxy", false);
+        case ProxyIP: {
+            // contains IP at index 0 and port at index 1
+            QStringList strlIpPort = settings.value("addrProxy").toString().split(":", QString::SkipEmptyParts);
+            return strlIpPort.at(0);
         }
-        painter->setPen(foreground);
-        QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true);
-        if(!confirmed)
+        case ProxyPort: {
+            // contains IP at index 0 and port at index 1
+            QStringList strlIpPort = settings.value("addrProxy").toString().split(":", QString::SkipEmptyParts);
+            return strlIpPort.at(1);
+        }
+
+        // separate Tor proxy
+        case ProxyUseTor:
+            return settings.value("fUseSeparateProxyTor", false);
+        case ProxyIPTor: {
+            // contains IP at index 0 and port at index 1
+            QStringList strlIpPort = settings.value("addrSeparateProxyTor").toString().split(":", QString::SkipEmptyParts);
+            return strlIpPort.at(0);
+        }
+        case ProxyPortTor: {
+            // contains IP at index 0 and port at index 1
+            QStringList strlIpPort = settings.value("addrSeparateProxyTor").toString().split(":", QString::SkipEmptyParts);
+            return strlIpPort.at(1);
+        }
+
+#ifdef ENABLE_WALLET
+        case SpendZeroConfChange:
+            return settings.value("bSpendZeroConfChange");
+        case ShowMasternodesTab:
+            return settings.value("fShowMasternodesTab");
+        case ShowAdvancedPSUI:
+            return fShowAdvancedPSUI;
+        case LowKeysWarning:
+            return settings.value("fLowKeysWarning");
+        case PrivateSendRounds:
+            return settings.value("nPrivateSendRounds");
+        case PrivateSendAmount:
+            return settings.value("nPrivateSendAmount");
+        case PrivateSendMultiSession:
+            return settings.value("fPrivateSendMultiSession");
+#endif
+        case DisplayUnit:
+            return nDisplayUnit;
+        case ThirdPartyTxUrls:
+            return strThirdPartyTxUrls;
+        case Digits:
+            return settings.value("digits");
+        case Theme:
+            return settings.value("theme");
+        case Language:
+            return settings.value("language");
+        case CoinControlFeatures:
+            return fCoinControlFeatures;
+        case DatabaseCache:
+            return settings.value("nDatabaseCache");
+        case ThreadsScriptVerif:
+            return settings.value("nThreadsScriptVerif");
+        case Listen:
+            return settings.value("fListen");
+        default:
+            return QVariant();
+        }
+    }
+    return QVariant();
+}
+
+// write QSettings values
+bool OptionsModel::setData(const QModelIndex & index, const QVariant & value, int role)
+{
+    bool successful = true; /* set to false on parse error */
+    if(role == Qt::EditRole)
+    {
+        QSettings settings;
+        switch(index.row())
         {
-            amountText = QString("[") + amountText + QString("]");
+        case StartAtStartup:
+            successful = GUIUtil::SetStartOnSystemStartup(value.toBool());
+            break;
+        case MinimizeToTray:
+            fMinimizeToTray = value.toBool();
+            settings.setValue("fMinimizeToTray", fMinimizeToTray);
+            break;
+        case MapPortUPnP: // core option - can be changed on-the-fly
+            settings.setValue("fUseUPnP", value.toBool());
+            MapPort(value.toBool());
+            break;
+        case MinimizeOnClose:
+            fMinimizeOnClose = value.toBool();
+            settings.setValue("fMinimizeOnClose", fMinimizeOnClose);
+            break;
+
+        // default proxy
+        case ProxyUse:
+            if (settings.value("fUseProxy") != value) {
+                settings.setValue("fUseProxy", value.toBool());
+                setRestartRequired(true);
+            }
+            break;
+        case ProxyIP: {
+            // contains current IP at index 0 and current port at index 1
+            QStringList strlIpPort = settings.value("addrProxy").toString().split(":", QString::SkipEmptyParts);
+            // if that key doesn't exist or has a changed IP
+            if (!settings.contains("addrProxy") || strlIpPort.at(0) != value.toString()) {
+                // construct new value from new IP and current port
+                QString strNewValue = value.toString() + ":" + strlIpPort.at(1);
+                settings.setValue("addrProxy", strNewValue);
+                setRestartRequired(true);
+            }
         }
-        painter->drawText(amountRect, Qt::AlignRight|Qt::AlignVCenter, amountText);
+        break;
+        case ProxyPort: {
+            // contains current IP at index 0 and current port at index 1
+            QStringList strlIpPort = settings.value("addrProxy").toString().split(":", QString::SkipEmptyParts);
+            // if that key doesn't exist or has a changed port
+            if (!settings.contains("addrProxy") || strlIpPort.at(1) != value.toString()) {
+                // construct new value from current IP and new port
+                QString strNewValue = strlIpPort.at(0) + ":" + value.toString();
+                settings.setValue("addrProxy", strNewValue);
+                setRestartRequired(true);
+            }
+        }
+        break;
 
-        painter->setPen(option.palette.color(QPalette::Text));
-        painter->drawText(amountRect, Qt::AlignLeft|Qt::AlignVCenter, GUIUtil::dateTimeStr(date));
+        // separate Tor proxy
+        case ProxyUseTor:
+            if (settings.value("fUseSeparateProxyTor") != value) {
+                settings.setValue("fUseSeparateProxyTor", value.toBool());
+                setRestartRequired(true);
+            }
+            break;
+        case ProxyIPTor: {
+            // contains current IP at index 0 and current port at index 1
+            QStringList strlIpPort = settings.value("addrSeparateProxyTor").toString().split(":", QString::SkipEmptyParts);
+            // if that key doesn't exist or has a changed IP
+            if (!settings.contains("addrSeparateProxyTor") || strlIpPort.at(0) != value.toString()) {
+                // construct new value from new IP and current port
+                QString strNewValue = value.toString() + ":" + strlIpPort.at(1);
+                settings.setValue("addrSeparateProxyTor", strNewValue);
+                setRestartRequired(true);
+            }
+        }
+        break;
+        case ProxyPortTor: {
+            // contains current IP at index 0 and current port at index 1
+            QStringList strlIpPort = settings.value("addrSeparateProxyTor").toString().split(":", QString::SkipEmptyParts);
+            // if that key doesn't exist or has a changed port
+            if (!settings.contains("addrSeparateProxyTor") || strlIpPort.at(1) != value.toString()) {
+                // construct new value from current IP and new port
+                QString strNewValue = strlIpPort.at(0) + ":" + value.toString();
+                settings.setValue("addrSeparateProxyTor", strNewValue);
+                setRestartRequired(true);
+            }
+        }
+        break;
 
-        painter->restore();
+#ifdef ENABLE_WALLET
+        case SpendZeroConfChange:
+            if (settings.value("bSpendZeroConfChange") != value) {
+                settings.setValue("bSpendZeroConfChange", value);
+                setRestartRequired(true);
+            }
+            break;
+        case ShowMasternodesTab:
+            if (settings.value("fShowMasternodesTab") != value) {
+                settings.setValue("fShowMasternodesTab", value);
+                setRestartRequired(true);
+            }
+            break;
+        case ShowAdvancedPSUI:
+            fShowAdvancedPSUI = value.toBool();
+            settings.setValue("fShowAdvancedPSUI", fShowAdvancedPSUI);
+            Q_EMIT advancedPSUIChanged(fShowAdvancedPSUI);
+            break;
+        case LowKeysWarning:
+            settings.setValue("fLowKeysWarning", value);
+            break;
+        case PrivateSendRounds:
+            if (settings.value("nPrivateSendRounds") != value)
+            {
+                nPrivateSendRounds = value.toInt();
+                settings.setValue("nPrivateSendRounds", nPrivateSendRounds);
+                Q_EMIT privateSendRoundsChanged();
+            }
+            break;
+        case PrivateSendAmount:
+            if (settings.value("nPrivateSendAmount") != value)
+            {
+                nPrivateSendAmount = value.toInt();
+                settings.setValue("nPrivateSendAmount", nPrivateSendAmount);
+                Q_EMIT privateSentAmountChanged();
+            }
+            break;
+        case PrivateSendMultiSession:
+            if (settings.value("fPrivateSendMultiSession") != value)
+            {
+                fPrivateSendMultiSession = value.toBool();
+                settings.setValue("fPrivateSendMultiSession", fPrivateSendMultiSession);
+            }
+            break;
+#endif
+        case DisplayUnit:
+            setDisplayUnit(value);
+            break;
+        case ThirdPartyTxUrls:
+            if (strThirdPartyTxUrls != value.toString()) {
+                strThirdPartyTxUrls = value.toString();
+                settings.setValue("strThirdPartyTxUrls", strThirdPartyTxUrls);
+                setRestartRequired(true);
+            }
+            break;
+        case Digits:
+            if (settings.value("digits") != value) {
+                settings.setValue("digits", value);
+                setRestartRequired(true);
+            }
+            break;
+        case Theme:
+            if (settings.value("theme") != value) {
+                settings.setValue("theme", value);
+                setRestartRequired(true);
+            }
+            break;
+        case Language:
+            if (settings.value("language") != value) {
+                settings.setValue("language", value);
+                setRestartRequired(true);
+            }
+            break;
+        case CoinControlFeatures:
+            fCoinControlFeatures = value.toBool();
+            settings.setValue("fCoinControlFeatures", fCoinControlFeatures);
+            Q_EMIT coinControlFeaturesChanged(fCoinControlFeatures);
+            break;
+        case DatabaseCache:
+            if (settings.value("nDatabaseCache") != value) {
+                settings.setValue("nDatabaseCache", value);
+                setRestartRequired(true);
+            }
+            break;
+        case ThreadsScriptVerif:
+            if (settings.value("nThreadsScriptVerif") != value) {
+                settings.setValue("nThreadsScriptVerif", value);
+                setRestartRequired(true);
+            }
+            break;
+        case Listen:
+            if (settings.value("fListen") != value) {
+                settings.setValue("fListen", value);
+                setRestartRequired(true);
+            }
+            break;
+        default:
+            break;
+        }
     }
 
-    inline QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const
+    Q_EMIT dataChanged(index, index);
+
+    return successful;
+}
+
+/** Updates current unit in memory, settings and emits displayUnitChanged(newUnit) signal */
+void OptionsModel::setDisplayUnit(const QVariant &value)
+{
+    if (!value.isNull())
     {
-        return QSize(DECORATION_SIZE, DECORATION_SIZE);
-    }
-
-    int unit;
-
-};
-#include "overviewpage.moc"
-
-OverviewPage::OverviewPage(QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::OverviewPage),
-    clientModel(0),
-    walletModel(0),
-    currentBalance(-1),
-    currentUnconfirmedBalance(-1),
-    currentImmatureBalance(-1),
-    txdelegate(new TxViewDelegate()),
-    filter(0)
-{
-    ui->setupUi(this);
-
-    // Recent transactions
-    ui->listTransactions->setItemDelegate(txdelegate);
-    ui->listTransactions->setIconSize(QSize(DECORATION_SIZE, DECORATION_SIZE));
-    ui->listTransactions->setMinimumHeight(NUM_ITEMS * (DECORATION_SIZE + 2));
-    ui->listTransactions->setAttribute(Qt::WA_MacShowFocusRect, false);
-
-    connect(ui->listTransactions, SIGNAL(clicked(QModelIndex)), this, SLOT(handleTransactionClicked(QModelIndex)));
-
-    // init "out of sync" warning labels
-    ui->labelWalletStatus->setText("(" + tr("out of sync") + ")");
-    ui->labelTransactionsStatus->setText("(" + tr("out of sync") + ")");
-
-    // start with displaying the "out of sync" warnings
-    showOutOfSyncWarning(true);
-}
-
-void OverviewPage::handleTransactionClicked(const QModelIndex &index)
-{
-    if(filter)
-        emit transactionClicked(filter->mapToSource(index));
-}
-
-OverviewPage::~OverviewPage()
-{
-    delete ui;
-}
-
-void OverviewPage::setBalance(qint64 balance, qint64 unconfirmedBalance, qint64 immatureBalance)
-{
-    int unit = walletModel->getOptionsModel()->getDisplayUnit();
-    currentBalance = balance;
-    currentUnconfirmedBalance = unconfirmedBalance;
-    currentImmatureBalance = immatureBalance;
-    ui->labelBalance->setText(BitcoinUnits::formatWithUnit(unit, balance));
-    ui->labelUnconfirmed->setText(BitcoinUnits::formatWithUnit(unit, unconfirmedBalance));
-    ui->labelImmature->setText(BitcoinUnits::formatWithUnit(unit, immatureBalance));
-
-    // only show immature (newly mined) balance if it's non-zero, so as not to complicate things
-    // for the non-mining users
-    bool showImmature = immatureBalance != 0;
-    ui->labelImmature->setVisible(showImmature);
-    ui->labelImmatureText->setVisible(showImmature);
-}
-
-void OverviewPage::setClientModel(ClientModel *model)
-{
-    this->clientModel = model;
-    if(model)
-    {
-        // Show warning if this is a prerelease version
-        connect(model, SIGNAL(alertsChanged(QString)), this, SLOT(updateAlerts(QString)));
-        updateAlerts(model->getStatusBarWarnings());
+        QSettings settings;
+        nDisplayUnit = value.toInt();
+        settings.setValue("nDisplayUnit", nDisplayUnit);
+        Q_EMIT displayUnitChanged(nDisplayUnit);
     }
 }
 
-void OverviewPage::setWalletModel(WalletModel *model)
+bool OptionsModel::getProxySettings(QNetworkProxy& proxy) const
 {
-    this->walletModel = model;
-    if(model && model->getOptionsModel())
-    {
-        // Set up transaction list
-        filter = new TransactionFilterProxy();
-        filter->setSourceModel(model->getTransactionTableModel());
-        filter->setLimit(NUM_ITEMS);
-        filter->setDynamicSortFilter(true);
-        filter->setSortRole(Qt::EditRole);
-        filter->sort(TransactionTableModel::Status, Qt::DescendingOrder);
+    // Directly query current base proxy, because
+    // GUI settings can be overridden with -proxy.
+    proxyType curProxy;
+    if (GetProxy(NET_IPV4, curProxy)) {
+        proxy.setType(QNetworkProxy::Socks5Proxy);
+        proxy.setHostName(QString::fromStdString(curProxy.proxy.ToStringIP()));
+        proxy.setPort(curProxy.proxy.GetPort());
 
-        ui->listTransactions->setModel(filter);
-        ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
-
-        // Keep up to date with wallet
-        setBalance(model->getBalance(), model->getUnconfirmedBalance(), model->getImmatureBalance());
-        connect(model, SIGNAL(balanceChanged(qint64, qint64, qint64)), this, SLOT(setBalance(qint64, qint64, qint64)));
-
-        connect(model->getOptionsModel(), SIGNAL(displayUnitChanged(int)), this, SLOT(updateDisplayUnit()));
+        return true;
     }
+    else
+        proxy.setType(QNetworkProxy::NoProxy);
 
-    // update the display unit, to not use the default ("BTC")
-    updateDisplayUnit();
+    return false;
 }
 
-void OverviewPage::updateDisplayUnit()
+void OptionsModel::setRestartRequired(bool fRequired)
 {
-    if(walletModel && walletModel->getOptionsModel())
-    {
-        if(currentBalance != -1)
-            setBalance(currentBalance, currentUnconfirmedBalance, currentImmatureBalance);
-
-        // Update txdelegate->unit with the current unit
-        txdelegate->unit = walletModel->getOptionsModel()->getDisplayUnit();
-
-        ui->listTransactions->update();
-    }
+    QSettings settings;
+    return settings.setValue("fRestartRequired", fRequired);
 }
 
-void OverviewPage::updateAlerts(const QString &warnings)
+bool OptionsModel::isRestartRequired()
 {
-    this->ui->labelAlerts->setVisible(!warnings.isEmpty());
-    this->ui->labelAlerts->setText(warnings);
-}
-
-void OverviewPage::showOutOfSyncWarning(bool fShow)
-{
-    ui->labelWalletStatus->setVisible(fShow);
-    ui->labelTransactionsStatus->setVisible(fShow);
+    QSettings settings;
+    return settings.value("fRestartRequired", false).toBool();
 }
